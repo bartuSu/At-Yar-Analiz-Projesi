@@ -1,16 +1,16 @@
 """
-At Yarışı Kupon Önericisi - Ana Dashboard
+At Yarışı Kupon Önericisi - Ana Dashboard (CSV tabanlı, sadeleştirilmiş)
 
 Kullanıcı:
-1. TJK Resmi Program PDF'ini yükler (otomatik parse edilir, başarısız
-   olan koşular için elle düzeltme tablosu gösterilir)
-2. 1. Altılı mı 2. Altılı mı seçer (PDF'ten otomatik tespit edilir)
-3. TJK AGF sayfasından kopyaladığı metni yapıştırır (OCR yok, düz metin)
+1. TJK'nın resmi günlük yarış programı CSV'sini yükler (PDF DEĞİL - çok
+   daha güvenilir, yapılandırılmış veri, manuel düzeltmeye gerek kalmıyor)
+2. Hangi altılıyı oynayacağını seçer (CSV'den otomatik tespit edilir,
+   bulunamazsa elle işaretleme seçeneği var)
+3. AGF kaynağını seçer: CSV'nin içindeki (otomatik) ya da TJK AGF
+   sayfasından kopyaladığı güncel metin
 4. Bütçesini girer
 
 Sistem:
-- AGF yüzdesini "ganyan"a çevirir (pseudo_ganyan = 100/agf_yuzde)
-- At/jokey/antrenör/sahip isimlerini geçmiş veriden ID'lerine eşler
 - Ganyanlı model (model.pkl) ile bütçe optimizasyonu yapıp GÜVENLİ kupon oluşturur
 - Ganyansız model (model_ganyansiz.pkl) ile "value" hesaplayıp, en az
   bedelli 1-2 ayakta SÜRPRİZ at zorlayarak TEK BİR birleşik kupon üretir
@@ -18,8 +18,7 @@ Sistem:
   tutma olasılığını gösterir
 
 Çalıştırma:
-    python -m pip install streamlit pdfplumber
-    python -m streamlit run main_dashboard.py
+    streamlit run main_dashboard.py
 """
 import json
 import math
@@ -32,13 +31,13 @@ import pandas as pd
 import streamlit as st
 
 import scraper_config
-from parse_program_csv import parse_pdf, sehir_ve_tarih_tahmin_et
+from parse_program_csv import parse_program_csv, sehir_ve_tarih_tahmin_et, altili_secenekleri_bul
 
 SURPRIZ_AYAK_SAYISI = 2
 COMBINASYON_BIRIM_FIYATI = 1.0  # TL - VARSAYIM, gerçek fiyatı doğrula
 
 # ============================================================
-# 1) AGF METİN PARSER
+# 1) AGF METİN PARSER (web sitesinden yapıştırma seçeneği için)
 # ============================================================
 
 AYAK_BASLIK_RE = re.compile(r"(\d+)\s*\.\s*AYAK", re.IGNORECASE)
@@ -61,10 +60,8 @@ def parse_agf_text(ham_metin: str) -> dict[int, dict]:
         blok_baslangic = esleme.end()
         blok_bitis = baslik_eslesmeleri[i + 1].start() if i + 1 < len(baslik_eslesmeleri) else len(ham_metin)
         blok = ham_metin[blok_baslangic:blok_bitis]
-
         kosanlar_metni = blok.split("KOŞMAZ", 1)[0] if "KOŞMAZ" in blok else blok
         sonuc[ayak_no] = {int(at_no): _yuzde_to_float(yuzde) for at_no, yuzde in AT_YUZDE_RE.findall(kosanlar_metni)}
-
     return sonuc
 
 
@@ -104,6 +101,10 @@ def load_features_lookup():
     jokey_son = df.dropna(subset=["jokey_id"]).drop_duplicates("jokey_id", keep="last").set_index("jokey_id")
     antrenor_son = df.dropna(subset=["antrenor_id"]).drop_duplicates("antrenor_id", keep="last").set_index("antrenor_id")
     sahip_son = df.dropna(subset=["sahip_id"]).drop_duplicates("sahip_id", keep="last").set_index("sahip_id")
+    # YENİ: baba/anne isim bazlı lookup - CSV'den doğrudan baba/anne ismi geldiği için,
+    # at_id eşleşmesi başarısız olsa bile soy hattı bilgisiyle tahmin yapabiliyoruz.
+    baba_son = df.dropna(subset=["baba"]).drop_duplicates("baba", keep="last").set_index("baba")
+    anne_son = df.dropna(subset=["anne"]).drop_duplicates("anne", keep="last").set_index("anne")
 
     medyanlar = {
         "son_3_ort_sira": df["son_3_ort_sira"].median(),
@@ -115,7 +116,7 @@ def load_features_lookup():
         "baba_kazanma_orani": df["baba_kazanma_orani"].median(),
         "anne_kazanma_orani": df["anne_kazanma_orani"].median(),
     }
-    return at_son, jokey_son, antrenor_son, sahip_son, medyanlar
+    return at_son, jokey_son, antrenor_son, sahip_son, baba_son, anne_son, medyanlar
 
 
 # ============================================================
@@ -130,7 +131,8 @@ def at_id_bul(at_isim: str, at_son_df: pd.DataFrame):
     return eslesenler.index[0]
 
 
-def canli_satir_olustur(at: dict, name_cache, at_son, jokey_son, antrenor_son, sahip_son, medyanlar) -> dict:
+def canli_satir_olustur(at: dict, name_cache, at_son, jokey_son, antrenor_son, sahip_son,
+                         baba_son, anne_son, medyanlar) -> dict:
     satir = {"kilo": at["kilo"]}
 
     at_id = at_id_bul(at["isim"], at_son)
@@ -139,16 +141,23 @@ def canli_satir_olustur(at: dict, name_cache, at_son, jokey_son, antrenor_son, s
         satir["son_3_ort_sira"] = gecmis.get("son_3_ort_sira", medyanlar["son_3_ort_sira"])
         satir["gecmis_yaris_sayisi"] = gecmis.get("gecmis_yaris_sayisi", medyanlar["gecmis_yaris_sayisi"]) + 1
         satir["son_yaristan_gun_farki"] = medyanlar["son_yaristan_gun_farki"]
-        satir["baba_kazanma_orani"] = gecmis.get("baba_kazanma_orani", medyanlar["baba_kazanma_orani"])
-        satir["anne_kazanma_orani"] = gecmis.get("anne_kazanma_orani", medyanlar["anne_kazanma_orani"])
         satir["_at_bulundu"] = True
     else:
         satir["son_3_ort_sira"] = medyanlar["son_3_ort_sira"]
         satir["gecmis_yaris_sayisi"] = 0
         satir["son_yaristan_gun_farki"] = medyanlar["son_yaristan_gun_farki"]
-        satir["baba_kazanma_orani"] = medyanlar["baba_kazanma_orani"]
-        satir["anne_kazanma_orani"] = medyanlar["anne_kazanma_orani"]
         satir["_at_bulundu"] = False
+
+    # Baba/anne kazanma oranı: CSV'den gelen isimle DOĞRUDAN ara (at_id eşleşmesine
+    # bağımlı değil - yeni/bilinmeyen bir at bile, ebeveyni tanınıyorsa bundan faydalanır)
+    for alan, son_df, kolon in [
+        (at.get("baba"), baba_son, "baba_kazanma_orani"),
+        (at.get("anne"), anne_son, "anne_kazanma_orani"),
+    ]:
+        if alan and alan in son_df.index:
+            satir[kolon] = son_df.loc[alan, kolon]
+        else:
+            satir[kolon] = medyanlar[kolon]
 
     for alan, cache_key, son_df, kolon in [
         ("jokey", "jokey_adi_to_id", jokey_son, "jokey_id_kazanma_orani"),
@@ -184,34 +193,46 @@ def prepare_for_model(df: pd.DataFrame, feature_cols: list[str]) -> pd.DataFrame
     return df
 
 
-def kosu_verisi_hazirla(kosu_no_list, kosu_atlari, kosu_meta, sehir, agf_verisi,
+def kosu_verisi_hazirla(kosu_no_list, altili_no, kosular_parsed, sehir,
+                         agf_kaynagi, agf_yapistirilan,
                          model_g, fc_g, model_gs, fc_gs,
-                         name_cache, at_son, jokey_son, antrenor_son, sahip_son, medyanlar):
-    """
-    kosu_atlari: {kosu_no: [{"at_no", "isim", "kilo", "jokey", "sahip", "antrenor"}, ...]}
-    kosu_meta:   {kosu_no: {"mesafe": int, "pist": str}}
-    """
+                         name_cache, at_son, jokey_son, antrenor_son, sahip_son,
+                         baba_son, anne_son, medyanlar):
     legs = []
     bulunamayan_atlar = []
 
-    for i, kosu_no in enumerate(kosu_no_list):
-        atlar = kosu_atlari.get(kosu_no, [])
-        meta = kosu_meta.get(kosu_no, {})
-        agf_ayak = agf_verisi.get(i + 1, {})  # AGF ayak no'su seçilen altılı içinde 1'den başlar
+    for ayak_index, kosu_no in enumerate(kosu_no_list, start=1):
+        kosu = kosular_parsed[kosu_no]
+        koşacak_atlar = [a for a in kosu["atlar"] if not a["kosmaz"]]
 
-        if not atlar:
-            raise ValueError(f"{kosu_no}. koşu için at verisi yok - PDF'ten parse edilemedi ve elle de girilmedi.")
+        if not koşacak_atlar:
+            raise ValueError(f"{kosu_no}. koşuda koşacak at bulunamadı.")
 
         satirlar = []
-        for at in atlar:
-            satir = canli_satir_olustur(at, name_cache, at_son, jokey_son, antrenor_son, sahip_son, medyanlar)
+        for at in koşacak_atlar:
+            satir = canli_satir_olustur(at, name_cache, at_son, jokey_son, antrenor_son,
+                                         sahip_son, baba_son, anne_son, medyanlar)
             satir["at_no"] = at["at_no"]
             satir["at_isim"] = at["isim"]
-            satir["mesafe"] = meta.get("mesafe") or 1400
-            satir["pist"] = meta.get("pist") or "Kum"
+            satir["mesafe"] = kosu.get("mesafe") or 1400
+            satir["pist"] = kosu.get("pist") or "Çim"
             satir["sehir"] = sehir
 
-            agf_yuzde = agf_ayak.get(at["at_no"])
+            # AGF kaynağı: web'den yapıştırılan varsa onu tercih et, yoksa CSV'nin içindeki
+            if agf_kaynagi == "yapistir" and agf_yapistirilan:
+                agf_yuzde = agf_yapistirilan.get(ayak_index, {}).get(at["at_no"])
+            else:
+                degerler = at.get("agf_degerleri") or []
+                if len(degerler) > 1:
+                    # bu koşu birden fazla altılıya ait (çakışma bölgesi) - doğru altılının
+                    # AGF'sini seçmemiz lazım. Değerlerin sırası CSV'de altılı sırasına göre.
+                    idx = 0 if altili_no == 1 else min(altili_no - 1, len(degerler) - 1)
+                    agf_yuzde = degerler[idx]
+                elif len(degerler) == 1:
+                    agf_yuzde = degerler[0]
+                else:
+                    agf_yuzde = None
+
             if agf_yuzde and agf_yuzde > 0:
                 satir["ganyan"] = 100 / agf_yuzde
                 satir["agf_yuzde"] = agf_yuzde
@@ -325,122 +346,76 @@ def olasilik_hesapla(legs, kupon, key="model_olasiliklari"):
 st.set_page_config(page_title="At Yarışı Kupon Önericisi", layout="wide")
 st.title("🐎 At Yarışı Kupon Önericisi")
 
-# --- PDF YÜKLEME ---
-st.sidebar.header("1) Resmi Programı Yükle")
-pdf_dosya = st.sidebar.file_uploader("TJK Resmi Program PDF'i", type=["pdf"])
+# --- CSV YÜKLEME ---
+st.sidebar.header("1) Resmi Program CSV'sini Yükle")
+csv_dosya = st.sidebar.file_uploader("TJK Günlük Yarış Programı CSV'si", type=["csv"])
 
-if pdf_dosya is None:
-    st.info("👈 Önce soldan TJK resmi program PDF'ini yükle.")
+if csv_dosya is None:
+    st.info("👈 Önce soldan TJK resmi program CSV'ini yükle (GunlukYarisProgrami-TR.csv).")
     st.stop()
 
-with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
-    tmp.write(pdf_dosya.read())
+with tempfile.NamedTemporaryFile(delete=False, suffix=".csv") as tmp:
+    tmp.write(csv_dosya.read())
     tmp_path = tmp.name
 
-with st.spinner("PDF parse ediliyor..."):
-    kosular_parsed = parse_pdf(tmp_path)
+with st.spinner("CSV parse ediliyor..."):
+    kosular_parsed = parse_program_csv(tmp_path)
 
-sehir_tahmin, tarih_tahmin = sehir_ve_tarih_tahmin_et(pdf_dosya.name)
+if not kosular_parsed:
+    st.error("CSV'den hiç koşu bulunamadı - dosyanın doğru formatta olduğundan emin ol.")
+    st.stop()
 
-st.sidebar.subheader("Koşu Durumu")
-for kosu_no in sorted(kosular_parsed):
-    durum = kosular_parsed[kosu_no]["durum"]
-    isaret = {"ok": "✅", "kilo_uyusmuyor": "⚠️", "manuel_gerekli": "❌"}.get(durum, "❓")
-    st.sidebar.write(f"{isaret} {kosu_no}. Koşu")
+sehir_tahmin, tarih_tahmin = sehir_ve_tarih_tahmin_et(csv_dosya.name)
+
+st.sidebar.success(f"✅ {len(kosular_parsed)} koşu başarıyla okundu.")
+with st.sidebar.expander("Koşu özeti"):
+    for kosu_no in sorted(kosular_parsed):
+        k = kosular_parsed[kosu_no]
+        kosan = sum(1 for a in k["atlar"] if not a["kosmaz"])
+        st.write(f"{kosu_no}. Koşu [{k['saat']}] - {kosan} at")
 
 st.sidebar.header("2) Şehir / Tarih")
 sehir = st.sidebar.text_input("Şehir", value=sehir_tahmin or "")
 tarih = st.sidebar.text_input("Tarih (GG/AA/YYYY)", value=tarih_tahmin or "")
 
-# --- KOŞU VERİLERİNİ GÖSTER / DÜZENLE ---
-st.header("📋 Koşu Verilerini Kontrol Et / Düzenle")
-
-manuel_gereken = [k for k, v in kosular_parsed.items() if v["durum"] != "ok"]
-if manuel_gereken:
-    st.warning(
-        f"{len(manuel_gereken)} koşu otomatik parse edilemedi: {sorted(manuel_gereken)}. "
-        "Aşağıdaki tablolara elle gir (At No, İsim, Kilo, Jokey, Sahip, Antrenör dolu olmalı)."
-    )
-
-kosu_atlari_final = {}
-kosu_meta_final = {}
-
-for kosu_no in sorted(kosular_parsed):
-    kosu = kosular_parsed[kosu_no]
-    kosu_meta_final[kosu_no] = {"mesafe": kosu.get("mesafe"), "pist": kosu.get("pist")}
-
-    baslik = f"{kosu_no}. Koşu"
-    if kosu.get("mesafe"):
-        baslik += f" ({kosu['mesafe']}m, {kosu.get('pist', '?')})"
-    if kosu.get("altili_baslangic"):
-        baslik += f" — {kosu['altili_baslangic']} 6'lı burdan başlıyor"
-
-    with st.expander(baslik, expanded=(kosu["durum"] != "ok")):
-        if kosu["durum"] == "ok":
-            df_goster = pd.DataFrame([
-                {"At No": at["at_no"], "İsim": at["isim"], "Kilo": at["kilo_metin"],
-                 "Jokey": at.get("jokey"), "Sahip": at.get("sahip"), "Antrenör": at.get("antrenor")}
-                for at in kosu["atlar"]
-            ])
-        else:
-            st.caption("⚠️ Otomatik parse edilemedi - elle gir (satır eklemek için tablonun altına tıkla)")
-            df_goster = pd.DataFrame(columns=["At No", "İsim", "Kilo", "Jokey", "Sahip", "Antrenör"])
-
-        duzenlenmis = st.data_editor(
-            df_goster, num_rows="dynamic", key=f"editor_{kosu_no}", use_container_width=True,
-        )
-
-        kosu_atlari_final[kosu_no] = [
-            {"at_no": int(r["At No"]), "isim": str(r["İsim"]), "kilo": float(r["Kilo"]),
-             "jokey": str(r["Jokey"]) if pd.notna(r["Jokey"]) else "",
-             "sahip": str(r["Sahip"]) if pd.notna(r["Sahip"]) else "",
-             "antrenor": str(r["Antrenör"]) if pd.notna(r["Antrenör"]) else ""}
-            for _, r in duzenlenmis.iterrows()
-            if pd.notna(r["At No"]) and pd.notna(r["İsim"])
-        ]
-
-
-# --- ALTILI SEÇİMİ (otomatik tespit + elle işaretleme seçeneği) ---
+# --- ALTILI SEÇİMİ (CSV'den otomatik tespit + elle işaretleme yedeği) ---
 st.sidebar.header("3) Altılı Seç")
-
-ETIKET_HARITASI = {
-    "BİRİNCİ": "1. Altılı", "İKİNCİ": "2. Altılı", "ÜÇÜNCÜ": "3. Altılı",
-    "KARMA": "Karma Altılı", "TEK": "Altılı",
-}
-
-altili_secenekleri = {}
-for kosu_no, kosu in kosular_parsed.items():
-    etiket = kosu.get("altili_baslangic")
-    if etiket:
-        ad = ETIKET_HARITASI.get(etiket, etiket)
-        altili_secenekleri[f"{ad} ({kosu_no}-{kosu_no + 5}. koşular) [otomatik bulundu]"] = list(range(kosu_no, kosu_no + 6))
+altili_secenekleri = altili_secenekleri_bul(kosular_parsed)
 
 secenek_listesi = list(altili_secenekleri.keys()) + ["✏️ Elle seç"]
 altili_secim = st.sidebar.radio("Hangi 6'lı ganyan?", secenek_listesi)
 
 if altili_secim == "✏️ Elle seç":
-    st.sidebar.caption(
-        "PDF'te altılının hangi koşudan başladığı otomatik bulunamadı (ya da "
-        "farklı bir kombinasyon istiyorsun) - aşağıdan TAM OLARAK 6 koşu işaretle."
-    )
-    tum_kosular = sorted(kosular_parsed.keys())
-    secilenler = []
-    for kosu_no in tum_kosular:
-        varsayilan = kosu_no in secilenler  # önceki seçimi hatırlamaya çalış
-        if st.sidebar.checkbox(f"{kosu_no}. Koşu", key=f"manuel_altili_{kosu_no}"):
-            secilenler.append(kosu_no)
-
+    st.sidebar.caption("Aşağıdan TAM OLARAK 6 koşu işaretle.")
+    secilenler = [
+        kosu_no for kosu_no in sorted(kosular_parsed)
+        if st.sidebar.checkbox(f"{kosu_no}. Koşu", key=f"manuel_{kosu_no}")
+    ]
     if len(secilenler) != 6:
-        st.sidebar.warning(f"Şu an {len(secilenler)} koşu işaretli - tam olarak 6 tane işaretlemen lazım.")
+        st.sidebar.warning(f"Şu an {len(secilenler)} koşu işaretli - tam 6 tane olmalı.")
         st.stop()
     kosu_no_list = sorted(secilenler)
+    altili_no = 1  # elle seçimde tek AGF değeri varsayılır
 else:
-    kosu_no_list = altili_secenekleri[altili_secim]
+    altili_no, kosu_no_list = altili_secenekleri[altili_secim]
 
-# --- AGF METNİ ---
-st.sidebar.header("4) AGF Metnini Yapıştır")
-st.sidebar.caption("TJK AGF sayfasından Ctrl+A, Ctrl+C ile kopyala")
-agf_metin = st.sidebar.text_area("AGF tablosu (düz metin)", height=200)
+# --- AGF KAYNAĞI ---
+st.sidebar.header("4) AGF Kaynağı")
+agf_kaynagi_secim = st.sidebar.radio(
+    "Hangi AGF kullanılsın?",
+    ["CSV'deki AGF (otomatik)", "TJK web sayfasından güncel AGF yapıştır"],
+)
+agf_kaynagi = "csv" if agf_kaynagi_secim.startswith("CSV") else "yapistir"
+
+agf_yapistirilan = None
+if agf_kaynagi == "yapistir":
+    st.sidebar.caption("tjk.org/AGFv2/... sayfasından Ctrl+A, Ctrl+C ile kopyala")
+    agf_metin = st.sidebar.text_area("AGF tablosu (düz metin)", height=200)
+    if agf_metin.strip():
+        try:
+            agf_yapistirilan = parse_agf_text(agf_metin)
+        except ValueError as e:
+            st.sidebar.error(str(e))
 
 # --- BÜTÇE ---
 st.sidebar.header("5) Bütçe")
@@ -453,42 +428,33 @@ calistir = st.sidebar.button("🎯 Kupon Oluştur", type="primary", use_containe
 # ============================================================
 
 if calistir:
-    eksik_kosular = [k for k in kosu_no_list if not kosu_atlari_final.get(k)]
-    if eksik_kosular:
-        st.error(f"Şu koşularda at verisi eksik: {eksik_kosular}. Yukarıdaki tabloları doldur.")
-        st.stop()
-
-    if not agf_metin.strip():
-        st.error("AGF metni boş - önce yapıştırman lazım.")
-        st.stop()
-
-    try:
-        agf_verisi = parse_agf_text(agf_metin)
-    except ValueError as e:
-        st.error(str(e))
+    if agf_kaynagi == "yapistir" and not agf_yapistirilan:
+        st.error("AGF metni boş ya da hatalı - önce yapıştırman lazım, ya da 'CSV'deki AGF'yi kullan' seç.")
         st.stop()
 
     with st.spinner("Modeller ve geçmiş veri yükleniyor..."):
         model_g, fc_g, model_gs, fc_gs = load_models()
         name_cache = load_name_cache()
-        at_son, jokey_son, antrenor_son, sahip_son, medyanlar = load_features_lookup()
+        at_son, jokey_son, antrenor_son, sahip_son, baba_son, anne_son, medyanlar = load_features_lookup()
 
     if name_cache is None:
-        st.warning("name_id_cache.json bulunamadı - `python build_name_id_cache.py` çalıştırmanı öneririm.")
+        st.warning("name_id_cache.json bulunamadı.")
 
     with st.spinner("Koşu verileri hazırlanıyor, model tahminleri üretiliyor..."):
         try:
             legs, bulunamayanlar = kosu_verisi_hazirla(
-                kosu_no_list, kosu_atlari_final, kosu_meta_final, sehir, agf_verisi,
+                kosu_no_list, altili_no, kosular_parsed, sehir,
+                agf_kaynagi, agf_yapistirilan,
                 model_g, fc_g, model_gs, fc_gs,
-                name_cache, at_son, jokey_son, antrenor_son, sahip_son, medyanlar,
+                name_cache, at_son, jokey_son, antrenor_son, sahip_son,
+                baba_son, anne_son, medyanlar,
             )
         except ValueError as e:
             st.error(str(e))
             st.stop()
 
     if bulunamayanlar:
-        st.info(f"Geçmiş veride bulunamayan {len(bulunamayanlar)} at için medyan değer kullanıldı: "
+        st.info(f"Geçmiş veride bulunamayan {len(bulunamayanlar)} at için medyan/soy tahmini kullanıldı: "
                 f"{', '.join(bulunamayanlar)}")
 
     maks_kombinasyon = int(butce / COMBINASYON_BIRIM_FIYATI)
