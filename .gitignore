@@ -1,0 +1,11 @@
+# Veri klasörleri (çok fazla dosya içerdiği için)
+data/raw/
+data/processed/
+
+# Python önbellek dosyaları
+__pycache__/
+*.pyc
+
+# Sanal ortam
+venv/
+env/
